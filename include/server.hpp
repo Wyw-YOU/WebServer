@@ -5,199 +5,308 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <fstream>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
-#include <fcntl.h>
+#include <errno.h>
+
+#include <unordered_map>
+#include <chrono>
+#include <string>
+#include <sstream>
 
 #include "threadpool.hpp"
 #include "http_parser.hpp"
 #include "log.hpp"
 
 /*
-    高性能WebServer
-    epoll(ET) + Reactor + ThreadPool
+    客户端连接信息
 */
+struct Client
+{
+    int fd;
+    std::chrono::steady_clock::time_point last_active;
+};
 
 class Server
 {
 
 private:
 
-    int port;           // 服务器端口
+    int port;
+    int listenfd;
+    int epollfd;
 
-    int listenfd;       // 监听socket
-
-    int epollfd;        // epoll描述符
-
-    ThreadPool pool;    // 线程池
+    ThreadPool pool;
 
     static const int MAX_EVENTS = 1024;
-
     epoll_event events[MAX_EVENTS];
+
+    std::unordered_map<int, Client> clients;
 
 public:
 
-    /*
-        构造函数
-        port：监听端口
-        threadNum：线程池数量
-    */
     Server(int port,int threadNum)
         :port(port),pool(threadNum)
-    {
-
-    }
+    {}
 
     /*
-        设置socket为非阻塞
+        设置非阻塞
     */
     void setNonBlocking(int fd)
     {
         int flags = fcntl(fd,F_GETFL);
-
         fcntl(fd,F_SETFL,flags | O_NONBLOCK);
     }
 
     /*
-        初始化服务器
+        初始化
     */
     bool init()
     {
-
         listenfd = socket(AF_INET,SOCK_STREAM,0);
 
-        if(listenfd < 0)
-        {
-            Log::error("socket create failed");
-            return false;
-        }
+        int opt = 1;
+        setsockopt(listenfd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
 
         sockaddr_in addr;
-
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port);
         addr.sin_addr.s_addr = INADDR_ANY;
 
         bind(listenfd,(sockaddr*)&addr,sizeof(addr));
-
         listen(listenfd,128);
 
-        // 设置非阻塞
         setNonBlocking(listenfd);
 
-        // 创建epoll
         epollfd = epoll_create(1);
 
         epoll_event ev;
-
         ev.events = EPOLLIN;
-
         ev.data.fd = listenfd;
 
         epoll_ctl(epollfd,EPOLL_CTL_ADD,listenfd,&ev);
 
-        Log::info("Server start success");
+        LOG_INFO("Server start success");
 
         return true;
     }
 
     /*
-    处理客户端请求
-    使用ET模式必须循环读取
-    使用sendfile实现零拷贝发送文件
+        MIME类型
+    */
+    std::string getMimeType(const std::string& path)
+    {
+        if(path.find(".html") != std::string::npos) return "text/html";
+        if(path.find(".css")  != std::string::npos) return "text/css";
+        if(path.find(".js")   != std::string::npos) return "application/javascript";
+        if(path.find(".png")  != std::string::npos) return "image/png";
+        if(path.find(".jpg")  != std::string::npos) return "image/jpeg";
+        return "text/plain";
+    }
+
+    /*
+        处理客户端
     */
     void handleClient(int clientfd)
     {
-
+        LOG_INFO("handleClient fd=" + std::to_string(clientfd));
+    
         char buffer[4096];
-
         std::string request;
-
-        // ET模式读取必须循环
+    
+        // ===== 1. 读取数据（ET必须循环读） =====
         while(true)
         {
-
-            int len = read(clientfd,buffer,sizeof(buffer));
-
+            int len = read(clientfd, buffer, sizeof(buffer));
+    
             if(len > 0)
             {
-                request.append(buffer,len);
+                request.append(buffer, len);
+                LOG_DEBUG("read bytes=" + std::to_string(len));
             }
-            else
+            else if(len == -1 && errno == EAGAIN)
             {
                 break;
             }
-
+            else if(len == 0)
+            {
+                LOG_INFO("client closed fd=" + std::to_string(clientfd));
+                close(clientfd);
+                clients.erase(clientfd);
+                return;
+            }
+            else
+            {
+                LOG_ERROR("read error fd=" + std::to_string(clientfd));
+                close(clientfd);
+                clients.erase(clientfd);
+                return;
+            }
         }
-
-        if(request.empty())
+    
+        if(request.empty()) return;
+    
+        LOG_INFO("HTTP request:\n" + request);
+    
+        // ===== 2. 解析HTTP =====
+        HttpRequest req = HttpParser::parse(request);
+    
+        LOG_INFO("method=" + req.method + " url=" + req.url);
+    
+        // ===== 3. POST处理（新增核心） =====
+        if(req.method == "POST")
         {
-            close(clientfd);
+            LOG_INFO("POST body=" + req.body);
+    
+            auto form = parseForm(req.body);
+    
+            if(req.url == "/login")
+            {
+                std::string username = form["username"];
+                std::string password = form["password"];
+    
+                LOG_INFO("login user=" + username);
+    
+                if(username == "admin" && password == "123")
+                {
+                    sendFile(clientfd, "www/success.html", req.isKeepAlive());
+                }
+                else
+                {
+                    sendFile(clientfd, "www/error.html", req.isKeepAlive());
+                }
+            }
+    
             return;
         }
-
-        Log::info("HTTP request received");
-
-        // 解析HTTP请求
-        HttpRequest req = HttpParser::parse(request);
-
-        Log::info("Method: " + req.method);
-        Log::info("URL: " + req.url);
-        Log::info("Version: " + req.version);
-
-        if(req.headers.count("User-Agent"))
+    
+        // ===== 4. GET处理 =====
+        if(req.method == "GET")
         {
-            Log::info("User-Agent: " + req.headers["User-Agent"]);
+            std::string filePath = "www";
+    
+            if(req.url == "/")
+                filePath += "/index.html";
+            else
+                filePath += req.url;
+    
+            sendFile(clientfd, filePath, req.isKeepAlive());
         }
+    }
 
-        // 构造文件路径
-        std::string filePath = "www";
-
-        if(req.url == "/")
-            filePath += "/index.html";
-        else
-            filePath += req.url;
-
-        // 打开文件
-        int filefd = open(filePath.c_str(),O_RDONLY);
+    void sendFile(int clientfd, const std::string& filePath, bool keepAlive)
+    {
+        int filefd = open(filePath.c_str(), O_RDONLY);
 
         if(filefd == -1)
         {
-
-            std::string notFound =
-            "HTTP/1.1 404 Not Found\r\n"
-            "Content-Type: text/plain\r\n\r\n"
-            "404 Not Found";
-
-            write(clientfd,notFound.c_str(),notFound.size());
-
+            LOG_ERROR("404 file=" + filePath);
+        
+            std::string notFound = "www/404.html";
+        
+            int fd404 = open(notFound.c_str(), O_RDONLY);
+        
+            if(fd404 == -1)
+            {
+                // 极端情况：连404页面都没
+                std::string res = "HTTP/1.1 404 Not Found\r\n\r\n404 Not Found";
+                write(clientfd, res.c_str(), res.size());
+                close(clientfd);
+                clients.erase(clientfd);
+                return;
+            }
+        
+            struct stat st;
+            fstat(fd404, &st);
+        
+            std::string header =
+                "HTTP/1.1 404 Not Found\r\n"
+                "Content-Type: text/html\r\n"
+                "Content-Length: " + std::to_string(st.st_size) + "\r\n\r\n";
+        
+            write(clientfd, header.c_str(), header.size());
+        
+            off_t offset = 0;
+            while(offset < st.st_size)
+            {
+                ssize_t sent = sendfile(clientfd, fd404, &offset, st.st_size - offset);
+        
+                if(sent <= 0)
+                {
+                    if(errno == EAGAIN) continue;
+                    break;
+                }
+            }
+        
+            close(fd404);
             close(clientfd);
-
+            clients.erase(clientfd);
             return;
         }
 
-        // 获取文件信息
-        struct stat file_stat;
+        struct stat st;
+        fstat(filefd, &st);
 
-        fstat(filefd,&file_stat);
-
-        // 构造HTTP响应头
         std::string header =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/html\r\n"
-        "Content-Length: " + std::to_string(file_stat.st_size) + "\r\n"
-        "\r\n";
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: " + getMimeType(filePath) + "\r\n"
+            "Content-Length: " + std::to_string(st.st_size) + "\r\n";
 
-        write(clientfd,header.c_str(),header.size());
+        if(keepAlive)
+            header += "Connection: keep-alive\r\n";
+        else
+            header += "Connection: close\r\n";
 
-        // 使用sendfile发送文件（零拷贝）
-        sendfile(clientfd,filefd,nullptr,file_stat.st_size);
+        header += "\r\n";
+
+        write(clientfd, header.c_str(), header.size());
+
+        off_t offset = 0;
+        while(offset < st.st_size)
+        {
+            ssize_t sent = sendfile(clientfd, filefd, &offset, st.st_size - offset);
+
+            if(sent <= 0)
+            {
+                if(errno == EAGAIN) continue;
+                break;
+            }
+        }
 
         close(filefd);
 
-        close(clientfd);
+        if(!keepAlive)
+        {
+            close(clientfd);
+            clients.erase(clientfd);
+        }
+        else
+        {
+            clients[clientfd].last_active = std::chrono::steady_clock::now();
+        }
+    }
 
+    // 表单解析
+    std::unordered_map<std::string,std::string>
+    parseForm(const std::string& body)
+    {
+        std::unordered_map<std::string,std::string> form;
+
+        std::stringstream ss(body);
+        std::string pair;
+
+        while(std::getline(ss, pair, '&'))
+        {
+            int pos = pair.find('=');
+            if(pos != std::string::npos)
+            {
+                std::string key = pair.substr(0, pos);
+                std::string value = pair.substr(pos + 1);
+                form[key] = value;
+            }
+        }
+
+        return form;
     }
 
     /*
@@ -205,54 +314,94 @@ public:
     */
     void start()
     {
-
         while(true)
         {
+            int n = epoll_wait(epollfd,events,MAX_EVENTS,1000);
 
-            int n = epoll_wait(epollfd,events,MAX_EVENTS,-1);
+            if(n == -1)
+            {
+                LOG_ERROR("epoll_wait error");
+                continue;
+            }
+
+            if(n == 0)
+            {
+                // 超时，不打印（避免刷屏）
+                continue;
+            }
+
+            // 有事件才打印
+            LOG_DEBUG("epoll triggered, events=" + std::to_string(n));
 
             for(int i=0;i<n;i++)
             {
-
                 int fd = events[i].data.fd;
 
-                // 新客户端连接
+                // 新连接（ET必须循环accept）
                 if(fd == listenfd)
                 {
+                    while(true)
+                    {
+                        sockaddr_in client_addr;
+                        socklen_t len = sizeof(client_addr);
 
-                    int clientfd = accept(listenfd,nullptr,nullptr);
+                        int clientfd = accept(listenfd,(sockaddr*)&client_addr,&len);
 
-                    setNonBlocking(clientfd);
+                        if(clientfd < 0)
+                        {
+                            if(errno == EAGAIN) break;
+                            else break;
+                        }
 
-                    epoll_event ev;
+                        char ip[INET_ADDRSTRLEN];
+                        inet_ntop(AF_INET,&client_addr.sin_addr,ip,sizeof(ip));
 
-                    ev.events = EPOLLIN | EPOLLET;
+                        int port = ntohs(client_addr.sin_port);
 
-                    ev.data.fd = clientfd;
+                        LOG_INFO("new client " + std::string(ip) + ":" + std::to_string(port));
 
-                    epoll_ctl(epollfd,EPOLL_CTL_ADD,clientfd,&ev);
+                        setNonBlocking(clientfd);
 
-                    Log::info("client connected");
+                        epoll_event ev;
+                        ev.events = EPOLLIN | EPOLLET;
+                        ev.data.fd = clientfd;
 
+                        epoll_ctl(epollfd,EPOLL_CTL_ADD,clientfd,&ev);
+
+                        clients[clientfd] = {clientfd,std::chrono::steady_clock::now()};
+                    }
                 }
                 else
                 {
-
                     int clientfd = fd;
 
-                    // Reactor模式
                     pool.addTask([this,clientfd](){
-
                         handleClient(clientfd);
-
                     });
-
                 }
-
             }
 
-        }
+            // 定时器（每轮执行）
+            auto now = std::chrono::steady_clock::now();
 
+            for(auto it = clients.begin(); it != clients.end(); )
+            {
+                auto duration = std::chrono::duration_cast<std::chrono::seconds>(
+                    now - it->second.last_active
+                ).count();
+
+                if(duration > 60)
+                {
+                    LOG_INFO("timeout fd=" + std::to_string(it->first));
+                    close(it->first);
+                    it = clients.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        }
     }
 
 };

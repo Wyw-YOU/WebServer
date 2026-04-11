@@ -17,6 +17,18 @@ struct HttpRequest
     std::unordered_map<std::string,std::string> headers; // 请求头
 
     std::string body;
+
+    /*
+    判断是否是长连接
+    */
+    bool isKeepAlive() const
+    {
+        if(headers.count("Connection"))
+        {
+            return headers.at("Connection") == "keep-alive";
+        }
+        return false;
+    }
 };
 
 /*
