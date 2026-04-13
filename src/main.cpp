@@ -14,6 +14,10 @@ int main()
     if(!server.init())
         return -1;
 
+    // // ===== 初始化测试用户（只执行一次）=====
+    // server.userService.login("admin","123") 
+    // || server.userService.registerUser("admin","123");
+
     // 启动服务器
     server.start();
 
