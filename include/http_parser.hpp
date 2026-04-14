@@ -2,6 +2,7 @@
 #define HTTP_PARSER_HPP
 
 #include <string>
+#include <sstream>
 #include <unordered_map>
 
 /*
@@ -23,10 +24,22 @@ struct HttpRequest
     */
     bool isKeepAlive() const
     {
-        if(headers.count("Connection"))
+        auto it = headers.find("Connection");
+    
+        // 显式 close
+        if(it != headers.end())
         {
-            return headers.at("Connection") == "keep-alive";
+            std::string v = it->second;
+            for(auto &c : v) c = tolower(c);
+    
+            if(v == "close") return false;
+            if(v == "keep-alive") return true;
         }
+    
+        // ===== 默认规则（关键！）=====
+        if(version == "HTTP/1.1")
+            return true;
+    
         return false;
     }
 };
@@ -57,56 +70,55 @@ public:
     */
     static HttpRequest parse(const std::string& request)
     {
-
         HttpRequest req;
 
-        PARSE_STATE state = REQUEST_LINE;
+        size_t pos = request.find("\r\n\r\n");
 
-        size_t pos = 0;
-
-        size_t lineEnd;
-
-        while((lineEnd = request.find("\r\n",pos)) != std::string::npos)
+        // ===== 1. Header 可能还不完整 =====
+        if(pos == std::string::npos)
         {
-
-            std::string line = request.substr(pos,lineEnd-pos);
-
-            pos = lineEnd + 2;
-
-            // 空行说明header结束
-            if(line.empty())
-            {
-                state = BODY;
-                break;
-            }
-
-            if(state == REQUEST_LINE)
-            {
-
-                parseRequestLine(line,req);
-
-                state = HEADERS;
-
-            }
-            else if(state == HEADERS)
-            {
-
-                parseHeader(line,req);
-
-            }
-
+            return req; // 返回空（调用方判断）
         }
 
-        // body解析
-        if(pos < request.size())
+        size_t headerLen = pos + 4;
+
+        std::string headerPart = request.substr(0, headerLen);
+
+        std::stringstream ss(headerPart);
+        std::string line;
+
+        // ===== 2. 请求行 =====
+        if(std::getline(ss, line))
         {
+            if(line.back() == '\r') line.pop_back();
 
-            req.body = request.substr(pos);
+            std::stringstream ls(line);
+            ls >> req.method >> req.url >> req.version;
+        }
 
+        // ===== 3. Header =====
+        while(std::getline(ss, line))
+        {
+            if(line == "\r" || line.empty()) break;
+
+            if(line.back() == '\r') line.pop_back();
+
+            size_t pos = line.find(':');
+            if(pos != std::string::npos)
+            {
+                std::string key = line.substr(0, pos);
+                std::string value = line.substr(pos + 2);
+                req.headers[key] = value;
+            }
+        }
+
+        // ===== 4. Body（可能不存在）=====
+        if(request.size() > headerLen)
+        {
+            req.body = request.substr(headerLen);
         }
 
         return req;
-
     }
 
 private:
