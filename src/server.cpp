@@ -13,11 +13,13 @@
 // 构造 & 析构
 /////////////////////////////////////////////////////
 
-Server::Server(int port,int threadNum)
-    :port(port),pool(threadNum)
+Server::Server(int port, int threadNum)
+    : port(port)
+    , pool(threadNum)
 {
+    // 初始化 MySQL 连接池
     mysqlPool = new MysqlPool(
-        5,"127.0.0.1","root","Aa962464.","webserver",3306
+        5, "127.0.0.1", "root", "Aa962464.", "webserver", 3306
     );
 
     userService = new UserService(mysqlPool);
@@ -39,8 +41,8 @@ Server::~Server()
 
 void Server::setNonBlocking(int fd)
 {
-    int flags = fcntl(fd,F_GETFL);
-    fcntl(fd,F_SETFL,flags | O_NONBLOCK);
+    int flags = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 void Server::addFd(int fd)
@@ -63,26 +65,30 @@ void Server::modFd(int fd)
 
 std::string Server::getMimeType(const std::string& path)
 {
-    if(path.find(".html") != std::string::npos) return "text/html";
-    if(path.find(".css")) return "text/css";
-    if(path.find(".js")) return "application/javascript";
-    if(path.find(".png")) return "image/png";
-    if(path.find(".jpg")) return "image/jpeg";
+    if (path.find(".html") != std::string::npos) return "text/html";
+    if (path.find(".css")  != std::string::npos) return "text/css";
+    if (path.find(".js")   != std::string::npos) return "application/javascript";
+    if (path.find(".png")  != std::string::npos) return "image/png";
+    if (path.find(".jpg")  != std::string::npos) return "image/jpeg";
+    if (path.find(".jpeg") != std::string::npos) return "image/jpeg";
+    if (path.find(".gif")  != std::string::npos) return "image/gif";
+    if (path.find(".ico")  != std::string::npos) return "image/x-icon";
+    // 可根据需要扩展更多类型
     return "text/plain";
 }
 
-std::unordered_map<std::string,std::string>
+std::unordered_map<std::string, std::string>
 Server::parseForm(const std::string& body)
 {
-    std::unordered_map<std::string,std::string> form;
+    std::unordered_map<std::string, std::string> form;
     std::stringstream ss(body);
     std::string pair;
 
-    while(std::getline(ss, pair, '&'))
+    while (std::getline(ss, pair, '&'))
     {
         int pos = pair.find('=');
-        if(pos != std::string::npos)
-            form[pair.substr(0,pos)] = pair.substr(pos+1);
+        if (pos != std::string::npos)
+            form[pair.substr(0, pos)] = pair.substr(pos + 1);
     }
     return form;
 }
@@ -93,28 +99,33 @@ Server::parseForm(const std::string& body)
 
 bool Server::init()
 {
-    listenfd = socket(AF_INET,SOCK_STREAM,0);
+    // 创建监听 socket
+    listenfd = socket(AF_INET, SOCK_STREAM, 0);
 
+    // 设置端口复用
     int opt = 1;
-    setsockopt(listenfd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
+    setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
+    // 绑定地址
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    bind(listenfd,(sockaddr*)&addr,sizeof(addr));
-    listen(listenfd,128);
+    bind(listenfd, (sockaddr*)&addr, sizeof(addr));
+    listen(listenfd, 128);
 
     setNonBlocking(listenfd);
 
+    // 创建 epoll 实例
     epollfd = epoll_create(1);
 
+    // 将监听 fd 加入 epoll
     epoll_event ev;
     ev.events = EPOLLIN;
     ev.data.fd = listenfd;
 
-    epoll_ctl(epollfd,EPOLL_CTL_ADD,listenfd,&ev);
+    epoll_ctl(epollfd, EPOLL_CTL_ADD, listenfd, &ev);
 
     LOG_INFO("Server start success");
     return true;
@@ -126,23 +137,24 @@ bool Server::init()
 
 void Server::start()
 {
-    while(true)
+    while (true)
     {
         int n = epoll_wait(epollfd, events, MAX_EVENTS, -1);
 
-        for(int i = 0; i < n; i++)
+        for (int i = 0; i < n; i++)
         {
             int fd = events[i].data.fd;
 
-            if(fd == listenfd)
+            // 新连接
+            if (fd == listenfd)
             {
-                while(true)
+                while (true)
                 {
-                    int clientfd = accept(listenfd,nullptr,nullptr);
+                    int clientfd = accept(listenfd, nullptr, nullptr);
 
-                    if(clientfd == -1)
+                    if (clientfd == -1)
                     {
-                        if(errno == EAGAIN) break;
+                        if (errno == EAGAIN) break;
                         else break;
                     }
 
@@ -159,14 +171,15 @@ void Server::start()
             }
             else
             {
-                if(events[i].events & EPOLLIN)
+                // 分发读写事件到线程池
+                if (events[i].events & EPOLLIN)
                 {
                     pool.addTask([this, fd](){
                         handleClient(fd);
                     });
                 }
 
-                if(events[i].events & EPOLLOUT)
+                if (events[i].events & EPOLLOUT)
                 {
                     pool.addTask([this, fd](){
                         handleWrite(fd);
@@ -178,7 +191,7 @@ void Server::start()
 }
 
 /////////////////////////////////////////////////////
-// 核心：处理客户端（含分包 + ONESHOT）
+// 核心：处理客户端请求（含分包读取 + ONESHOT 重激活）
 /////////////////////////////////////////////////////
 
 void Server::handleClient(int clientfd)
@@ -187,19 +200,20 @@ void Server::handleClient(int clientfd)
 
     char buffer[4096];
 
-    while(true)
+    // 循环读取直到 EAGAIN
+    while (true)
     {
         int len = read(clientfd, buffer, sizeof(buffer));
 
-        if(len > 0)
+        if (len > 0)
         {
             readBuffers[clientfd].append(buffer, len);
         }
-        else if(len == -1 && errno == EAGAIN)
+        else if (len == -1 && errno == EAGAIN)
         {
             break;
         }
-        else if(len == 0)
+        else if (len == 0)
         {
             LOG_INFO("peer closed (client FIN)fd=" + std::to_string(clientfd));
             close(clientfd);
@@ -214,12 +228,13 @@ void Server::handleClient(int clientfd)
     }
 
     std::string &buf = readBuffers[clientfd];
-    if(buf.empty()) return;
+    if (buf.empty()) return;
 
-    while(true)
+    // 循环处理粘在一起的多个 HTTP 请求
+    while (true)
     {
         size_t pos = buf.find("\r\n\r\n");
-        if(pos == std::string::npos) break;
+        if (pos == std::string::npos) break;
 
         size_t headerLen = pos + 4;
         std::string headerPart = buf.substr(0, headerLen);
@@ -227,12 +242,13 @@ void Server::handleClient(int clientfd)
 
         size_t totalLen = headerLen;
 
-        if(req.method == "POST" && req.headers.count("Content-Length"))
+        // 处理 POST 请求体
+        if (req.method == "POST" && req.headers.count("Content-Length"))
         {
             int bodyLen = std::stoi(req.headers["Content-Length"]);
             totalLen += bodyLen;
 
-            if(buf.size() < totalLen) break;
+            if (buf.size() < totalLen) break;   // body 未收全，等待
 
             req = HttpParser::parse(buf.substr(0, totalLen));
         }
@@ -240,16 +256,16 @@ void Server::handleClient(int clientfd)
         LOG_INFO("HTTP " + req.method + " " + req.url);
 
         // ===== 业务处理 =====
-        if(req.method == "POST")
+        if (req.method == "POST")
         {
             auto form = parseForm(req.body);
             std::string user = form["username"];
             std::string pwd  = form["password"];
 
-            if(req.url == "/login")
+            if (req.url == "/login")
             {
                 sendFile(clientfd,
-                    userService->login(user,pwd) ?
+                    userService->login(user, pwd) ?
                     "www/success.html" : "www/error.html",
                     req.isKeepAlive());
             }
@@ -262,9 +278,11 @@ void Server::handleClient(int clientfd)
             sendFile(clientfd, path, req.isKeepAlive());
         }
 
+        // 移除已处理的请求数据
         buf.erase(0, totalLen);
 
-        if(!req.isKeepAlive())
+        // 非 keep-alive 则关闭连接
+        if (!req.isKeepAlive())
         {
             close(clientfd);
             clients.erase(clientfd);
@@ -272,15 +290,15 @@ void Server::handleClient(int clientfd)
             return;
         }
 
-        if(buf.empty()) break;
+        if (buf.empty()) break;
     }
 
-    // 🔥 关键：重新激活 ONESHOT
+    // 重新激活 ONESHOT
     modFd(clientfd);
 }
 
 /////////////////////////////////////////////////////
-// sendFile
+// 准备发送文件（或错误响应）
 /////////////////////////////////////////////////////
 
 void Server::sendFile(int clientfd,
@@ -293,45 +311,45 @@ void Server::sendFile(int clientfd,
     WriteBuffer wb;
 
     int fd = open(filePath.c_str(), O_RDONLY);
-    if(fd == -1)
+    if (fd == -1)
     {
-    LOG_ERROR("file not found");
+        LOG_ERROR("file not found");
 
-    wb.header =
-    "HTTP/1.1 404 Not Found\r\n"
-    "Content-Length: 0\r\n"
-    "Connection: close\r\n\r\n";
+        wb.header =
+            "HTTP/1.1 404 Not Found\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n\r\n";
 
-    wb.keepAlive = false;
+        wb.keepAlive = false;
     }
     else
     {
-    struct stat st;
-    fstat(fd, &st);
+        struct stat st;
+        fstat(fd, &st);
 
-    wb.header =
-    "HTTP/1.1 200 OK\r\n"
-    "Content-Type: " + getMimeType(filePath) + "\r\n"
-    "Content-Length: " + std::to_string(st.st_size) + "\r\n" +
-    (keepAlive ? "Connection: keep-alive\r\n" : "Connection: close\r\n") +
-    "\r\n";
+        wb.header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: " + getMimeType(filePath) + "\r\n"
+            "Content-Length: " + std::to_string(st.st_size) + "\r\n" +
+            (keepAlive ? "Connection: keep-alive\r\n" : "Connection: close\r\n") +
+            "\r\n";
 
-    wb.fileFd = fd;
-    wb.fileSize = st.st_size;
-    wb.offset = 0;
-    wb.keepAlive = keepAlive;
+        wb.fileFd = fd;
+        wb.fileSize = st.st_size;
+        wb.offset = 0;
+        wb.keepAlive = keepAlive;
     }
 
     wb.headerSent = 0;
 
     writeBuffers[clientfd] = wb;
 
-    // 🔥 切换到写事件
+    // 切换到写事件监听
     epoll_event ev;
     ev.events = EPOLLOUT | EPOLLET | EPOLLONESHOT;
     ev.data.fd = clientfd;
 
-    if(epoll_ctl(epollfd, EPOLL_CTL_MOD, clientfd, &ev) == -1)
+    if (epoll_ctl(epollfd, EPOLL_CTL_MOD, clientfd, &ev) == -1)
     {
         LOG_ERROR("epoll_ctl MOD EPOLLOUT failed fd=" + std::to_string(clientfd));
     }
@@ -344,83 +362,118 @@ void Server::sendFile(int clientfd,
 }
 
 /////////////////////////////////////////////////////
-// handleWrite
+// 处理写事件（发送头部和文件内容）
 /////////////////////////////////////////////////////
-
-void Server::handleWrite(int clientfd)
-{
-    LOG_INFO("handleWrite fd=" + std::to_string(clientfd));
-    auto &wb = writeBuffers[clientfd];
-
-    // ===== 1. 发送 header =====
-    while(wb.headerSent < wb.header.size())
-    {
+// 发送 HTTP 响应头
+SendStatus Server::sendHeader(int clientfd, WriteBuffer& wb) {
+    while (wb.headerSent < wb.header.size()) {
         ssize_t n = write(clientfd,
-            wb.header.c_str() + wb.headerSent,
-            wb.header.size() - wb.headerSent);
+                          wb.header.c_str() + wb.headerSent,
+                          wb.header.size() - wb.headerSent);
 
-        if(n > 0)
-        {
+        if (n > 0) {
             wb.headerSent += n;
-        }
-        else if(n == -1 && errno == EAGAIN)
-        {
-            goto rearm;
-        }
-        else
-        {
-            goto close_conn;
+        } else if (n == -1 && errno == EAGAIN) {
+            return SendStatus::WOULD_BLOCK;
+        } else {
+            return SendStatus::ERROR;
         }
     }
+    return SendStatus::OK;
+}
 
-    // ===== 2. 发送文件 =====
-    while(wb.fileFd != -1 && wb.offset < wb.fileSize)
-    {
+// 发送文件内容（使用 sendfile）
+SendStatus Server::sendFileContent(int clientfd, WriteBuffer& wb) {
+    while (wb.fileFd != -1 && wb.offset < wb.fileSize) {
         ssize_t n = sendfile(clientfd,
                              wb.fileFd,
                              &wb.offset,
                              wb.fileSize - wb.offset);
 
-        if(n > 0)
-        {
+        if (n > 0) {
             continue;
-        }
-        else if(n == -1 && errno == EAGAIN)
-        {
-            goto rearm;
-        }
-        else
-        {
-            goto close_conn;
+        } else if (n == -1 && errno == EAGAIN) {
+            return SendStatus::WOULD_BLOCK;
+        } else {
+            return SendStatus::ERROR;
         }
     }
+    return SendStatus::OK;
+}
 
-    // ===== 3. 发送完成 =====
-    if(wb.fileFd != -1)
-        close(wb.fileFd);
-
-    if(wb.keepAlive)
-    {
-        LOG_INFO("write done keep-alive fd=" + std::to_string(clientfd));
-
-        writeBuffers.erase(clientfd);
-        modFd(clientfd); // 切回读
-        return;
-    }
-
-close_conn:
+// 关闭连接并清理所有相关资源
+void Server::closeConnection(int clientfd) {
     LOG_INFO("write done close fd=" + std::to_string(clientfd));
+
+    // 如果存在未关闭的文件描述符，先关闭
+    auto it = writeBuffers.find(clientfd);
+    if (it != writeBuffers.end() && it->second.fileFd != -1) {
+        close(it->second.fileFd);
+    }
 
     close(clientfd);
     clients.erase(clientfd);
     readBuffers.erase(clientfd);
     writeBuffers.erase(clientfd);
-    return;
+}
 
-rearm:
+// 重新注册写事件（未发送完时）
+void Server::rearmWriteEvent(int clientfd) {
     epoll_event ev;
     ev.events = EPOLLOUT | EPOLLET | EPOLLONESHOT;
     ev.data.fd = clientfd;
 
-    epoll_ctl(epollfd, EPOLL_CTL_MOD, clientfd, &ev);
+    if (epoll_ctl(epollfd, EPOLL_CTL_MOD, clientfd, &ev) == -1) {
+        LOG_ERROR("rearm EPOLLOUT failed fd=" + std::to_string(clientfd));
+        // 注册失败时主动关闭连接，避免资源泄漏
+        closeConnection(clientfd);
+    }
+}
+
+// 主处理函数
+void Server::handleWrite(int clientfd) {
+    LOG_INFO("handleWrite fd=" + std::to_string(clientfd));
+
+    auto it = writeBuffers.find(clientfd);
+    if (it == writeBuffers.end()) {
+        LOG_ERROR("handleWrite: no WriteBuffer for fd=" + std::to_string(clientfd));
+        closeConnection(clientfd);
+        return;
+    }
+
+    auto& wb = it->second;
+
+    // 1. 发送响应头
+    SendStatus status = sendHeader(clientfd, wb);
+
+    // 2. 若头部发送完成，继续发送文件内容
+    if (status == SendStatus::OK) 
+    {
+        status = sendFileContent(clientfd, wb);
+    }
+
+    // 3. 根据最终状态执行清理或续期
+    if (status == SendStatus::ERROR) 
+    {
+        closeConnection(clientfd);
+    } 
+    else if (status == SendStatus::WOULD_BLOCK) 
+    {
+        rearmWriteEvent(clientfd);
+    } 
+    else 
+    { // SendStatus::OK
+        // 发送全部完成，关闭文件描述符
+        if (wb.fileFd != -1) {
+            close(wb.fileFd);
+        }
+
+        if (wb.keepAlive) {
+            LOG_INFO("write done keep-alive fd=" + std::to_string(clientfd));
+            writeBuffers.erase(clientfd);
+            modFd(clientfd);      // 切换回读事件监听
+        } else {
+            closeConnection(clientfd);
+        }
+    }
 }
